@@ -1,7 +1,7 @@
 name: daily-report-and-pages
 on:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "0 1 * * *"     # 北京时间 09:00
   workflow_dispatch: {}
 permissions:
   contents: read
@@ -19,7 +19,7 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -r requirements.txt
       - name: Generate PDF
-        run: python report.py                 # 生成 ./report.pdf
+        run: python report.py
       - name: Prepare public folder
         run: |
           mkdir -p public
