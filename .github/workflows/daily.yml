@@ -1,4 +1,4 @@
-name: pages build and deployment
+name: Daily Report + Pages Deploy
 
 on:
   # 每天 09:00（北京）跑一次；也可以手动触发；当 main 有变更也会跑
