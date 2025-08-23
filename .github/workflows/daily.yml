@@ -1,0 +1,40 @@
+name: daily-report
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 每天 01:00 UTC 触发 ≈ 北京时间 09:00
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Generate PDF
+        env:
+          REPORT_URL: ${{ secrets.REPORT_URL }}
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python report.py
+
+      # 把 report.pdf 发布成 GitHub Pages 的静态文件
+      - name: Deploy report.pdf to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
+          publish_branch: gh-pages
+          keep_files: true
+          destination_dir: .
+          enable_jekyll: true
+          # 只发布 report.pdf（可选：也可发布 README）
+          exclude_assets: |
+            .github
+            requirements.txt
+            report.py
