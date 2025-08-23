@@ -2,7 +2,7 @@ name: daily-report-and-pages
 
 on:
   schedule:
-    - cron: "0 1 * * *"     # 每天 09:00 北京时间（01:00 UTC）
+    - cron: "0 1 * * *"     # 北京时间09:00
   workflow_dispatch: {}
 
 permissions:
@@ -27,15 +27,8 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Generate PDF
-        env:
-          # 这两个按你之前配置选择其一或都留空也行（只影响微信推送，不影响生成PDF）
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          # 先不需要 REPORT_URL（发布完成后就是固定 Pages 链接）
-        run: python report.py
+        run: python report.py   # 生成 ./report.pdf（确保report.py输出这个文件名）
 
-      # 把要发布到 Pages 的静态文件打包成 artifact
-      # 我们只需要把 report.pdf 放进一个文件夹（例如 public）
       - name: Prepare public folder
         run: |
           mkdir -p public
