@@ -1,12 +1,18 @@
-name: daily-report-and-pages
+name: pages build and deployment
+
 on:
+  # 每天 09:00（北京）跑一次；也可以手动触发；当 main 有变更也会跑
   schedule:
-    - cron: "0 1 * * *"   # 北京时间 09:00
+    - cron: "0 1 * * *"      # 01:00 UTC = 09:00 Beijing
   workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
 permissions:
   contents: read
   pages: write
   id-token: write
+
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -15,26 +21,43 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install -r requirements.txt
-      - name: Generate PDF
-        run: python report.py                   # 生成 ./report.pdf
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      # ★ 生成 PDF（这里会执行 report.py，顺便调用 Server酱 / PushPlus 推送）
+      - name: Generate PDF (and send WeChat/PushPlus)
+        env:
+          REPORT_URL: ${{ secrets.REPORT_URL }}                # 例：https://<user>.github.io/<repo>/report.pdf
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}# Server酱可选
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}        # PushPlus 可选
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}      # 如果你用到了 peers 动态获取
+        run: python report.py
+
+      # 把要发布的文件放进 public 目录（现在只放 report.pdf，后续可加 index.html 等）
       - name: Prepare public folder
         run: |
           mkdir -p public
           mv report.pdf public/
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
-        with: { path: ./public }
+        with:
+          path: ./public
 
   deploy:
     needs: build
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
