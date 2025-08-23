@@ -1,14 +1,12 @@
 name: daily-report-and-pages
 on:
   schedule:
-    - cron: "0 1 * * *"   # 每天 09:00 北京时间
+    - cron: "0 1 * * *"   # 北京时间 09:00
   workflow_dispatch: {}
-
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -21,19 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install -r requirements.txt
-
       - name: Generate PDF
-        run: python report.py
-
+        run: python report.py                   # 生成 ./report.pdf
       - name: Prepare public folder
         run: |
           mkdir -p public
           mv report.pdf public/
-
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./public
+        with: { path: ./public }
 
   deploy:
     needs: build
