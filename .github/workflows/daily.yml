@@ -2,8 +2,8 @@ name: Daily Report + Pages Deploy
 
 on:
   schedule:
-    - cron: "30 21 * * 1-5"   # 每个交易日美股收盘后（UTC，按需改）
-  workflow_dispatch: {}
+    - cron: "0 9 * * 1-5"   # UTC 09:00，工作日自动跑（你可改）
+  workflow_dispatch:        # 允许手动触发
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: "pages"
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -27,26 +27,49 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
       - name: Run report
         env:
-          # 若使用 Finnhub：到仓库 Settings → Secrets → Actions 新建 FINNHUB_API_KEY
+          # 这些可在 repo 的 Settings > Secrets and variables > Actions 里配置
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          # Server酱 Turbo：WECHAT_SCT_SENDKEY 同样放在 Secrets
           WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          # 用你的 Pages 地址替换下面两行
+          # 以下两个用于生成 HTML 里的下载链接；按你的 Pages 网址改
           REPORT_URL: https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/report.pdf
           SITE_URL:   https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/
-        run: python report.py
+        run: |
+          python report.py
 
+      # —— 诊断：看看文件是否真的生成在当前目录 ——
+      - name: List files for debug
+        run: |
+          pwd
+          ls -lah
+          echo "Try to locate report.pdf if not in cwd:"
+          find . -maxdepth 3 -type f -name "report.pdf" -printf "%p -> %k KB\n" || true
+
+      # —— 准备要发布到 Pages 的目录（public/）——
       - name: Prepare Pages artifact
         run: |
+          set -e
           mkdir -p public
-          mv report.pdf public/
-          mv index.html public/
-          mv table.csv public/
+          # 防止文件没生成导致直接失败，先检测再移动
+          for f in index.html report.pdf table.csv; do
+            if [ -f "$f" ]; then
+              mv "$f" public/
+            else
+              echo "MISS: $f (not found)"
+              # 关键文件 report.pdf 缺失就报错退出；HTML/CSV 缺失不致命
+              if [ "$f" = "report.pdf" ]; then
+                echo "::error::report.pdf not generated. Check previous step logs."
+                exit 1
+              fi
+            fi
+          done
+          echo "Public folder content:"
+          ls -lah public
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
@@ -60,6 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
