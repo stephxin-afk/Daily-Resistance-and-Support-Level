@@ -1,270 +1,258 @@
 # -*- coding: utf-8 -*-
 """
-Daily Pivot Levels (Ticker + Peers) — grouped by each seed
-
-Generates:
-- report.pdf   (A4 cover + one landscape page per seed group)
-- index.html   (responsive; group dropdown; main row blue, S1/R1 near 2% yellow)
-- table.csv    (flat table with a 'Group' column)
+Daily Pivot Levels (seed + peers)
+Outputs:
+  - table.csv      : flat table for all groups
+  - report.pdf     : one page per group
+  - index.html     : one section per seed, with filter & highlighting
 
 Env (optional):
-- TICKERS            CSV seeds, e.g. "NVDA,TSLA,HD"
-- DEFAULT_TICKERS    fallback seeds when TICKERS empty
-- FINNHUB_API_KEY    peers API
-- SITE_URL           e.g. https://<user>.github.io/<repo>/
-- REPORT_URL         e.g. https://<user>.github.io/<repo>/report.pdf
-- WECHAT_SCT_SENDKEY ServerChan Turbo key
-- PUSHPLUS_TOKEN     PushPlus token
-
-Deps: yfinance, pandas, matplotlib, requests
+  TICKERS           CSV of seed tickers, e.g. "NVDA,TSLA,HD"
+  DEFAULT_TICKERS   fallback when TICKERS empty
+  FINNHUB_API_KEY   peer API (optional)
+  SITE_URL          e.g. https://<user>.github.io/<repo>/
+  REPORT_URL        e.g. https://<user>.github.io/<repo>/report.pdf
 """
 
+from __future__ import annotations
 import os
 import sys
+import math
 import json
 import time
-import traceback
+import textwrap
+from datetime import datetime
 from typing import List, Dict, Tuple
 
 import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
+
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from datetime import datetime
 
-# -------------------- Global Config --------------------
+
 TITLE = "Daily Pivot Levels (Ticker + Peers)"
-SUB   = "P=(H+L+C)/3; S1=2P−H; S2=P−(H−L); R1=2P−L; R2=P+(H−L)"
-OUT_PDF = "report.pdf"
+SUB   = "Formulas: P=(H+L+C)/3; S1=2P−H; S2=P−(H−L); R1=2P−L; R2=P+(H−L)"
+
+OUT_CSV  = "table.csv"
+OUT_PDF  = "report.pdf"
 OUT_HTML = "index.html"
-OUT_CSV = "table.csv"
 
-# PDF 字体与字符
-matplotlib.rcParams["axes.unicode_minus"] = False
 
-# 默认备选（当既没有 TICKERS 也没有 DEFAULT_TICKERS）
-FALLBACK_SEEDS = ["NVDA", "TSLA", "HD", "TOL", "GOOGL", "AMD", "AMZN", "ADBE", "ASML", "COST", "STZ", "NIO"]
+# ------------------------ utilities ------------------------
 
-# -------------------- Utils --------------------
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
-def get_env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return (v if v is not None else default).strip()
 
-def split_csv(s: str) -> List[str]:
-    if not s:
+def env_csv(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default).strip()
+    if not raw:
         return []
-    return [x.strip().upper() for x in s.split(",") if x.strip()]
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-def _as_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
 
-# -------------------- Data helpers --------------------
-def get_peers_from_finnhub(symbol: str, limit: int = 10) -> List[str]:
-    key = get_env("FINNHUB_API_KEY")
-    if not key:
-        return []
-    url = f"https://finnhub.io/api/v1/stock/peers?symbol={symbol}&token={key}"
+# ------------------------ peers ------------------------
+
+# 少量安全锚点（当 Finnhub 不可用时）
+FALLBACK_PEERS: Dict[str, List[str]] = {
+    "NVDA": ["AMD", "AVGO", "QCOM", "MU", "TXN", "ADI", "INTC", "MRVL", "MPWR"],
+    "TSLA": ["GM", "F", "RIVN", "LCID", "NWTN", "THO", "WGO"],
+    "HD":   ["LOW", "FND", "TTSH", "GRWG", "POLCQ"],
+    "TOL":  ["DHI", "LEN", "PHM", "NVR", "BLD", "IBP", "TMHC", "MTH", "KBH", "SKY"],
+    "GOOGL":["META", "RDDT", "PINS", "SNAP", "MTCH", "DJT", "CARG", "RUM", "GRND"],
+    "AMD":  ["NVDA", "AVGO", "TXN", "QCOM", "MU", "ADI", "INTC", "MRVL", "MPWR"],
+    "AMZN": ["CPNG", "EBAY", "DDS", "OLLI", "ETSY", "M", "KSS", "GRPN", "LOGC"],
+    "ADBE": ["PLTR", "CRM", "INTU", "APP", "SNPS", "MSTR", "CDNS", "ADSK", "WDAY", "ROP"],
+    "ASML": ["ASML.AS", "ASM.AS", "BESI.AS"],
+    "COST": ["WMT", "TGT", "DG", "DLTR", "BJ", "PSMT", "OBDP"],
+    "STZ":  ["BF.B", "MGPI", "CWGL", "BLNE", "WVVI", "AMZE", "SBEV", "CASK", "RSAU"],
+    "NIO":  ["XPEV", "1958.HK", "600006.SS", "000550.SZ", "000980.SZ", "000572.SZ",
+             "ZK", "300825.SZ", "301322.SZ", "600303.SS"],
+}
+
+def finnhub_peers(seed: str, api_key: str) -> List[str]:
+    """Try Finnhub peers; return [] on failure."""
     try:
-        r = requests.get(url, timeout=12)
+        url = "https://finnhub.io/api/v1/stock/peers"
+        params = {"symbol": seed.upper(), "token": api_key}
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
-        peers = r.json()
-        if not isinstance(peers, list):
-            return []
-        peers = [p.upper() for p in peers if isinstance(p, str)]
-        peers = [p for p in peers if p != symbol.upper()]
-        return peers[:limit]
+        data = r.json()
+        if isinstance(data, list):
+            # 保守过滤（英文字母和点）
+            peers = [x.upper() for x in data if isinstance(x, str) and len(x) <= 12]
+            # 去掉自己
+            peers = [p for p in peers if p != seed.upper()]
+            return peers[:20]
     except Exception as e:
-        log(f"[Finnhub] {symbol} peers error: {e}")
-        return []
+        log(f"[Peers] fallback for {seed}: {e}")
+    return []
 
-def _flatten_ohlc_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """兼容 yfinance 单票也返回 MultiIndex 的情况：
-       1) ('High','NVDA')  -> 取第 0 层，得到 High/Low/Close...
-       2) ('NVDA','High')  -> 取第 1 层，得到 High/Low/Close...
-    """
-    if not isinstance(df.columns, pd.MultiIndex):
-        return df
+
+def get_peers(seed: str, api_key: str | None) -> List[str]:
+    peers: List[str] = []
+    if api_key:
+        peers = finnhub_peers(seed, api_key)
+    if not peers:
+        peers = FALLBACK_PEERS.get(seed.upper(), [])
+    return peers
+
+
+# ------------------------ data & pivots ------------------------
+
+def latest_row(symbol: str, period: str = "14d") -> Tuple[bool, Dict[str, float] | str]:
+    """Fetch latest OHLC + prev close for one ticker. Return (ok, data or reason)."""
     try:
-        tuples = list(df.columns)
-        lvl0 = {c[0] for c in tuples}
-        lvl1 = {c[1] for c in tuples}
-        fields = {"Open","High","Low","Close","Adj Close","Volume"}
-
-        if fields & lvl0 and len(lvl1) >= 1:
-            # ('Field', 'Ticker')
-            df.columns = [c[0] for c in tuples]
-            return df
-        if fields & lvl1 and len(lvl0) >= 1:
-            # ('Ticker', 'Field')
-            df.columns = [c[1] for c in tuples]
-            return df
-
-        # fallback，优先包含 High 的那一层
-        if "High" in lvl0:
-            df.columns = [c[0] for c in tuples]
-        elif "High" in lvl1:
-            df.columns = [c[1] for c in tuples]
+        # 使用单票 history，避免 yfinance download 的 MultiIndex 细节
+        df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+        if df is None or df.empty or not all(col in df.columns for col in ("High", "Low", "Close")):
+            return False, f"yfinance empty for {symbol}"
+        # 取最近两条（用倒数第一作为最新，倒数第二为 prev）
+        df = df.tail(2)
+        if df.shape[0] == 1:
+            h = float(df["High"].iloc[-1])
+            l = float(df["Low"].iloc[-1])
+            c = float(df["Close"].iloc[-1])
+            prev = c  # 没有前一日就等于自身，后续 %Chg=0
         else:
-            df.columns = [str(c[0]) for c in tuples]
-        return df
-    except Exception:
-        df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns]
-        return df
+            h = float(df["High"].iloc[-1])
+            l = float(df["Low"].iloc[-1])
+            c = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2])
 
-def fetch_bar(ticker: str) -> Tuple[str, float, float, float, float]:
-    """
-    Return: (date_str, high, low, close, prev_close)
-    兼容 yfinance MultiIndex 列；若没有倒数第二根，则 prev_close = close
-    """
-    df = yf.download(
-        ticker,
-        period="14d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="column",   # 维持 column 维度，再做拍平
-    )
-    if df is None or df.empty:
-        raise RuntimeError(f"yfinance empty for {ticker}")
+        # 保护
+        h = float(h); l = float(l); c = float(c); prev = float(prev)
 
-    # 拍平列
-    df = _flatten_ohlc_cols(df)
+        # Pivot
+        p = (h + l + c) / 3.0
+        s1 = 2 * p - h
+        s2 = p - (h - l)
+        r1 = 2 * p - l
+        r2 = p + (h - l)
+        denom = prev if abs(prev) > 1e-12 else 1.0
+        chg = (c - prev) / denom * 100.0
 
-    # reset index，找日期列（Date/Datetime 都兼容）
-    df = df.reset_index(drop=False)
-    cols_lower = {c.lower(): c for c in df.columns}
-    date_col = cols_lower.get("date") or cols_lower.get("datetime")
+        return True, {
+            "Date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "High": round(h, 2),
+            "Low": round(l, 2),
+            "Close": round(c, 2),
+            "PrevClose": round(prev, 2),
+            "% Chg": round(chg, 2),
+            "Pivot P": round(p, 2),
+            "S1": round(s1, 2),
+            "S2": round(s2, 2),
+            "R1": round(r1, 2),
+            "R2": round(r2, 2),
+        }
+    except Exception as e:
+        # yfinance 会偶现 missing error
+        if "possibly delisted" in str(e):
+            return False, f"yfinance empty for {symbol}"
+        return False, f"{type(e).__name__}: {e}"
 
-    last = df.iloc[-1]
-    if date_col is not None:
-        dt = last[date_col]
-    else:
-        dt = last.name
-    date_str = dt.date().isoformat() if hasattr(dt, "date") else str(dt)[:10]
 
-    def pick(colname: str) -> float:
-        # 容错大小写
-        for c in df.columns:
-            if str(c).lower() == colname.lower():
-                return float(last[c])
-        raise KeyError(f"column '{colname}' not found in {list(df.columns)}")
+def build_group(seed: str, anchors: List[str]) -> pd.DataFrame | None:
+    tickers = [seed.upper()] + [t for t in anchors if t.upper() != seed.upper()]
+    keep_records = []
+    for t in tickers:
+        ok, data_or_reason = latest_row(t)
+        if not ok:
+            log(f"[Data] skip {t}: {data_or_reason}")
+            continue
+        row = {"Ticker": t, **(data_or_reason)}  # type: ignore
+        row["Main"] = (t == seed.upper())
+        keep_records.append(row)
 
-    h = _as_float(pick("High"))
-    l = _as_float(pick("Low"))
-    c = _as_float(pick("Close"))
+    if not keep_records:
+        log(f"[Group] {seed} failed: No valid rows for group {seed}")
+        return None
 
-    if len(df) >= 2:
-        prev = df.iloc[-2]
-        # 同样容错找 Close
-        pc = None
-        for ccol in df.columns:
-            if str(ccol).lower() == "close":
-                pc = float(prev[ccol]); break
-        prevc = _as_float(pc if pc is not None else c)
-    else:
-        prevc = c
-
-    return date_str, h, l, c, prevc
-
-def pivots(h: float, l: float, c: float) -> Tuple[float, float, float, float, float]:
-    P = (h + l + c) / 3.0
-    S1 = 2 * P - h
-    S2 = P - (h - l)
-    R1 = 2 * P - l
-    R2 = P + (h - l)
-    return P, S1, S2, R1, R2
-
-def build_group(seed: str, extra_anchors: List[str] = None) -> pd.DataFrame:
-    if extra_anchors is None:
-        extra_anchors = []
-    group_name = f"{seed.upper()} + Peers"
-
-    peers = get_peers_from_finnhub(seed)
-    symbols = [seed.upper()] + [p for p in peers if p] + [a.upper() for a in extra_anchors if a]
-
-    rows = []
-    for t in symbols:
-        try:
-            date_str, h, l, c, prevc = fetch_bar(t)
-            P, S1, S2, R1, R2 = pivots(h, l, c)
-            chg = (c - prevc) / prevc * 100.0 if (prevc or prevc == 0) and abs(prevc) > 1e-12 else 0.0
-
-            rows.append({
-                "Ticker": t,
-                "Date": date_str,
-                "High": round(h, 2),
-                "Low": round(l, 2),
-                "Close": round(c, 2),
-                "PrevClose": round(prevc, 2),
-                "% Chg": round(chg, 2),
-                "Pivot P": round(P, 2),
-                "S1": round(S1, 2),
-                "S2": round(S2, 2),
-                "R1": round(R1, 2),
-                "R2": round(R2, 2),
-                "Group": group_name,
-                "Main": (t == seed.upper()),
-            })
-        except Exception as e:
-            log(f"[Data] skip {t}: {e}")
-
-    if not rows:
-        raise RuntimeError(f"No valid rows for group {seed}")
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values(by=["Main", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+    df = pd.DataFrame(keep_records)
+    # 将主票放第一行
+    df.sort_values(by=["Main", "Ticker"], ascending=[False, True], inplace=True)
+    df.insert(0, "Group", f"{seed.upper()} + Peers")
     return df
 
+
 def build_all(seeds: List[str]) -> List[pd.DataFrame]:
-    groups = []
-    for s in seeds:
-        try:
-            df = build_group(s)
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip() or None
+    groups: List[pd.DataFrame] = []
+    for seed in seeds:
+        peers = get_peers(seed, api_key)
+        df = build_group(seed, peers)
+        if df is not None and not df.empty:
+            log(f"[Group] {seed} ok: {len(df)} rows")
             groups.append(df)
-            log(f"[Group] {s} ok: {len(df)} rows")
-        except Exception as e:
-            log(f"[Group] {s} failed: {e}")
     if not groups:
         raise RuntimeError("No groups built. Check network or seed tickers.")
     return groups
 
-# -------------------- Outputs --------------------
-def write_csv(groups: List[pd.DataFrame], path: str) -> None:
+
+# ------------------------ write CSV ------------------------
+
+def write_csv(groups: List[pd.DataFrame]) -> None:
     all_df = pd.concat(groups, ignore_index=True)
-    all_df.to_csv(path, index=False)
-    log(f"Wrote {path}")
+    all_df.to_csv(OUT_CSV, index=False)
+    log(f"Wrote {OUT_CSV}")
 
-def write_pdf(groups: List[pd.DataFrame], path: str) -> None:
-    with PdfPages(path) as pdf:
+
+# ------------------------ write PDF ------------------------
+
+def draw_table_page(pdf: PdfPages, title: str, df: pd.DataFrame) -> None:
+    # 生成一个简洁的表格页
+    cols = ["Ticker", "Date", "High", "Low", "Close", "PrevClose", "% Chg", "Pivot P", "S1", "S2", "R1", "R2"]
+    df_print = df[cols].copy()
+
+    fig, ax = plt.subplots(figsize=(11.0, 7.5))  # 横向 A4 大致比例
+    ax.axis("off")
+    ax.set_title(title, fontsize=14, loc="left", pad=10)
+
+    # matplotlib table
+    tbl = ax.table(cellText=df_print.values,
+                   colLabels=df_print.columns,
+                   loc="center",
+                   cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.3)
+
+    # 高亮主票行
+    for i, is_main in enumerate(df["Main"].tolist(), start=1):  # +1 跳过表头行
+        if is_main:
+            for j in range(len(cols)):
+                tbl[(i, j)].set_facecolor("#e8f2ff")
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_pdf(groups: List[pd.DataFrame]) -> None:
+    with PdfPages(OUT_PDF) as pdf:
         # 封面
-        plt.figure(figsize=(8.27, 11.69))
-        plt.axis("off")
-        plt.text(0.5, 0.80, TITLE, ha="center", fontsize=20, fontweight="bold")
-        plt.text(0.5, 0.74, SUB, ha="center", fontsize=10)
-        plt.text(0.5, 0.69, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", ha="center", fontsize=9)
-        pdf.savefig(bbox_inches="tight"); plt.close()
+        fig, ax = plt.subplots(figsize=(11.0, 7.5))
+        ax.axis("off")
+        ax.text(0.02, 0.92, TITLE, fontsize=20, weight="bold", va="top")
+        ax.text(0.02, 0.86, SUB, fontsize=11)
+        ax.text(0.02, 0.82, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", fontsize=10, color="#666")
+        seeds = [g["Group"].iloc[0].split(" + ")[0] for g in groups]
+        chips = "  ".join(seeds)
+        ax.text(0.02, 0.74, f"Groups: {chips}", fontsize=11)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
 
-        # 每个分组一页
         for g in groups:
-            plt.figure(figsize=(11.69, 8.27))
-            plt.axis("off")
-            group_name = g["Group"].iloc[0]
-            plt.text(0.02, 0.97, group_name, fontsize=14, fontweight="bold", va="top")
-            cols = ["Ticker","Date","High","Low","Close","PrevClose","% Chg","Pivot P","S1","S2","R1","R2"]
-            table = plt.table(cellText=g[cols].values, colLabels=cols, loc="center")
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1.2, 1.3)
-            pdf.savefig(bbox_inches="tight"); plt.close()
-    log(f"Wrote {path}")
+            draw_table_page(pdf, g["Group"].iloc[0], g)
+
+    log(f"Wrote {OUT_PDF}")
+
+
+# ------------------------ write HTML ------------------------
 
 def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> None:
     group_names = [g["Group"].iloc[0] for g in groups]
@@ -275,40 +263,42 @@ def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> No
         rows = []
         for _, r in df.iterrows():
             close = float(r["Close"])
-            def near_2pct(x):
-                if close == 0 or abs(close) < 1e-12:
-                    return False
-                return abs(close - float(x)) / abs(close) < 0.02
-            cls_main = ' class="main-row"' if bool(r["Main"]) else ""
-            cell_s1_cls = ' class="near-cell"' if near_2pct(r["S1"]) else ""
-            cell_r1_cls = ' class="near-cell"' if near_2pct(r["R1"]) else ""
+            denom = abs(close) if abs(close) > 1e-9 else 1.0
 
-            rows.append(
-                "<tr{main}>"
-                "<td>{t}</td><td>{d}</td>"
-                "<td>{h}</td><td>{l}</td><td>{c}</td><td>{pc}</td>"
-                "<td class=\"chg {chgcls}\">{chg:.2f}%</td>"
-                "<td>{p}</td>"
-                f"<td{cell_s1_cls}>{s1}</td>"
-                "<td>{s2}</td>"
-                f"<td{cell_r1_cls}>{r1}</td>"
-                "<td>{r2}</td>"
-                "</tr>".format(
-                    main=cls_main,
-                    t=r["Ticker"], d=r["Date"],
-                    h=r["High"], l=r["Low"], c=r["Close"], pc=r["PrevClose"],
-                    chg=float(r["% Chg"]),
-                    chgcls=("pos" if float(r["% Chg"])>=0 else "neg"),
-                    p=r["Pivot P"], s1=r["S1"], s2=r["S2"], r1=r["R1"], r2=r["R2"]
-                )
+            def near_2pct(x) -> bool:
+                try:
+                    return abs(close - float(x)) / denom < 0.02
+                except Exception:
+                    return False
+
+            main_attr    = ' class="main-row"' if bool(r["Main"]) else ""
+            s1_cell_attr = ' class="near-cell"' if near_2pct(r["S1"]) else ""
+            r1_cell_attr = ' class="near-cell"' if near_2pct(r["R1"]) else ""
+            chg = float(r["% Chg"])
+            chgcls = "pos" if chg >= 0 else "neg"
+
+            row = (
+                f"<tr{main_attr}>"
+                f"<td>{r['Ticker']}</td><td>{r['Date']}</td>"
+                f"<td>{r['High']}</td><td>{r['Low']}</td><td>{r['Close']}</td><td>{r['PrevClose']}</td>"
+                f"<td class=\"chg {chgcls}\">{chg:.2f}%</td>"
+                f"<td>{r['Pivot P']}</td>"
+                f"<td{s1_cell_attr}>{r['S1']}</td>"
+                f"<td>{r['S2']}</td>"
+                f"<td{r1_cell_attr}>{r['R1']}</td>"
+                f"<td>{r['R2']}</td>"
+                "</tr>"
             )
+            rows.append(row)
+
         header = (
             "<thead><tr>"
-            "<th>Ticker</th><th>Date</th><th>High</th><th>Low</th><th>Close</th><th>PrevClose</th>"
-            "<th>% Chg</th><th>Pivot P</th><th>S1</th><th>S2</th><th>R1</th><th>R2</th>"
+            "<th>Ticker</th><th>Date</th><th>High</th><th>Low</th>"
+            "<th>Close</th><th>PrevClose</th><th>% Chg</th><th>Pivot P</th>"
+            "<th>S1</th><th>S2</th><th>R1</th><th>R2</th>"
             "</tr></thead>"
         )
-        return "<table>{hdr}<tbody>{rows}</tbody></table>".format(hdr=header, rows="".join(rows))
+        return f"<table>{header}<tbody>{''.join(rows)}</tbody></table>"
 
     sections = []
     for g in groups:
@@ -336,8 +326,10 @@ def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> No
     --border: #eee;
     --text: #222;
   }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif;
-         margin: 12px 12px 90px; color: var(--text); }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif;
+    margin: 12px 12px 90px; color: var(--text);
+  }}
   h1 {{ font-size: 1.25rem; margin: 0 0 4px; }}
   .sub {{ color:#666; font-size:.85rem; margin-bottom:10px; }}
   .bar {{ display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }}
@@ -406,79 +398,31 @@ def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> No
         f.write(html)
     log(f"Wrote {OUT_HTML}")
 
-# -------------------- Notifications --------------------
-def push_serverchan(sendkey: str, title: str, content_md: str) -> bool:
-    if not sendkey:
-        return False
-    try:
-        r = requests.post(
-            f"https://sctapi.ftqq.com/{sendkey}.send",
-            data={"title": title, "desp": content_md},
-            timeout=15,
-        )
-        log(f"[SCT] HTTP {r.status_code} | {r.text[:180]}")
-        r.raise_for_status()
-        return r.ok
-    except Exception as e:
-        log(f"[SCT] error: {e}")
-        return False
 
-def push_pushplus(token: str, title: str, content_html: str) -> bool:
-    if not token:
-        return False
-    try:
-        r = requests.post(
-            "https://www.pushplus.plus/send",
-            json={"token": token, "title": title, "content": content_html, "template": "html"},
-            timeout=15,
-        )
-        log(f"[PushPlus] HTTP {r.status_code} | {r.text[:180]}")
-        r.raise_for_status()
-        return r.ok
-    except Exception as e:
-        log(f"[PushPlus] error: {e}")
-        return False
+# ------------------------ main ------------------------
 
-# -------------------- Main --------------------
+def main() -> None:
+    seeds = env_csv("TICKERS")
+    if not seeds:
+        seeds = env_csv("DEFAULT_TICKERS", "NVDA,TSLA,HD,TOL,GOOGL,AMD,AMZN,ADBE,ASML,COST,STZ,NIO")
+    log(f"Seeds: {seeds}")
+
+    groups = build_all(seeds)
+    write_csv(groups)
+
+    # report URL / site URL
+    site_url   = os.getenv("SITE_URL", "").strip()
+    report_url = os.getenv("REPORT_URL", "").strip() or (site_url.rstrip("/") + "/report.pdf" if site_url else "report.pdf")
+
+    write_pdf(groups)
+    write_html(groups, report_url=report_url, site_url=site_url)
+
+
 if __name__ == "__main__":
     try:
-        # 1) 解析 seeds：TICKERS > DEFAULT_TICKERS > FALLBACK_SEEDS
-        seeds = split_csv(get_env("TICKERS"))
-        if not seeds:
-            seeds = split_csv(get_env("DEFAULT_TICKERS"))
-        if not seeds:
-            seeds = FALLBACK_SEEDS[:]
-        seeds = [s for s in seeds if s]
-
-        log(f"Seeds: {seeds}")
-
-        # 2) 组装数据
-        groups = build_all(seeds)
-
-        # 3) 输出 CSV / PDF / HTML
-        write_csv(groups, OUT_CSV)
-        write_pdf(groups, OUT_PDF)
-
-        report_url = get_env("REPORT_URL") or OUT_PDF
-        site_url   = get_env("SITE_URL") or ""
-        write_html(groups, report_url=report_url, site_url=site_url)
-
-        # 4) 通知（可选）
-        title = "Daily Pivot Levels — updated"
-        md_msg = (
-            f"**{title}**\n\n"
-            + (f"[📱 Online view]({site_url})\n\n" if site_url else "")
-            + f"[📄 Download PDF]({report_url})"
-        )
-        html_msg = (
-            f"<b>{title}</b><br>"
-            + (f"<a href=\"{site_url}\">📱 Online view</a><br>" if site_url else "")
-            + f"<a href=\"{report_url}\">📄 Download PDF</a>"
-        )
-        ok1 = push_serverchan(get_env("WECHAT_SCT_SENDKEY"), title, md_msg)
-        ok2 = push_pushplus(get_env("PUSHPLUS_TOKEN"), title, html_msg)
-        log(f"[Notify] ServerChan={ok1} PushPlus={ok2}")
-
-    except Exception:
-        log("FATAL ERROR:\n" + "".join(traceback.format_exception(*sys.exc_info())))
-        raise
+        main()
+    except Exception as e:
+        log("FATAL ERROR:")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
