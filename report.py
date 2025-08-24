@@ -78,13 +78,46 @@ def get_peers_from_finnhub(symbol: str, limit: int = 10) -> List[str]:
         peers = r.json()
         if not isinstance(peers, list):
             return []
-        # 去重并去掉自身
         peers = [p.upper() for p in peers if isinstance(p, str)]
         peers = [p for p in peers if p != symbol.upper()]
         return peers[:limit]
     except Exception as e:
         log(f"[Finnhub] {symbol} peers error: {e}")
         return []
+
+def _flatten_ohlc_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """兼容 yfinance 单票也返回 MultiIndex 的情况：
+       1) ('High','NVDA')  -> 取第 0 层，得到 High/Low/Close...
+       2) ('NVDA','High')  -> 取第 1 层，得到 High/Low/Close...
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    try:
+        tuples = list(df.columns)
+        lvl0 = {c[0] for c in tuples}
+        lvl1 = {c[1] for c in tuples}
+        fields = {"Open","High","Low","Close","Adj Close","Volume"}
+
+        if fields & lvl0 and len(lvl1) >= 1:
+            # ('Field', 'Ticker')
+            df.columns = [c[0] for c in tuples]
+            return df
+        if fields & lvl1 and len(lvl0) >= 1:
+            # ('Ticker', 'Field')
+            df.columns = [c[1] for c in tuples]
+            return df
+
+        # fallback，优先包含 High 的那一层
+        if "High" in lvl0:
+            df.columns = [c[0] for c in tuples]
+        elif "High" in lvl1:
+            df.columns = [c[1] for c in tuples]
+        else:
+            df.columns = [str(c[0]) for c in tuples]
+        return df
+    except Exception:
+        df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns]
+        return df
 
 def fetch_bar(ticker: str) -> Tuple[str, float, float, float, float]:
     """
@@ -97,39 +130,45 @@ def fetch_bar(ticker: str) -> Tuple[str, float, float, float, float]:
         interval="1d",
         auto_adjust=False,
         progress=False,
-        group_by="column",
+        group_by="column",   # 维持 column 维度，再做拍平
     )
     if df is None or df.empty:
         raise RuntimeError(f"yfinance empty for {ticker}")
 
     # 拍平列
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [ (c[-1] if isinstance(c, tuple) else c) for c in df.columns ]
-    df.columns = [ str(c) for c in df.columns ]
+    df = _flatten_ohlc_cols(df)
 
+    # reset index，找日期列（Date/Datetime 都兼容）
     df = df.reset_index(drop=False)
-    cmap = {c.lower(): c for c in df.columns}
-
-    def col(name: str) -> str:
-        key = name.lower()
-        if key not in cmap:
-            raise KeyError(f"column '{name}' not found in {list(df.columns)}")
-        return cmap[key]
+    cols_lower = {c.lower(): c for c in df.columns}
+    date_col = cols_lower.get("date") or cols_lower.get("datetime")
 
     last = df.iloc[-1]
-    dt = last[col("Date")] if col("Date") in last else last.name
+    if date_col is not None:
+        dt = last[date_col]
+    else:
+        dt = last.name
     date_str = dt.date().isoformat() if hasattr(dt, "date") else str(dt)[:10]
 
-    def v(x):  # series or scalar -> float
-        return float(x.iloc[0]) if isinstance(x, pd.Series) else float(x)
+    def pick(colname: str) -> float:
+        # 容错大小写
+        for c in df.columns:
+            if str(c).lower() == colname.lower():
+                return float(last[c])
+        raise KeyError(f"column '{colname}' not found in {list(df.columns)}")
 
-    h = _as_float(v(last[col("High")]))
-    l = _as_float(v(last[col("Low")]))
-    c = _as_float(v(last[col("Close")]))
+    h = _as_float(pick("High"))
+    l = _as_float(pick("Low"))
+    c = _as_float(pick("Close"))
 
     if len(df) >= 2:
         prev = df.iloc[-2]
-        prevc = _as_float(v(prev[col("Close")]))
+        # 同样容错找 Close
+        pc = None
+        for ccol in df.columns:
+            if str(ccol).lower() == "close":
+                pc = float(prev[ccol]); break
+        prevc = _as_float(pc if pc is not None else c)
     else:
         prevc = c
 
@@ -144,17 +183,10 @@ def pivots(h: float, l: float, c: float) -> Tuple[float, float, float, float, fl
     return P, S1, S2, R1, R2
 
 def build_group(seed: str, extra_anchors: List[str] = None) -> pd.DataFrame:
-    """
-    对单个 seed 构建一个 DataFrame: seed + peers (+ anchors)，并计算 pivot 指标。
-    返回列：
-      Ticker, Date, High, Low, Close, PrevClose, % Chg, Pivot P, S1, S2, R1, R2, Group, Main
-    其中 Group = '<SEED> + Peers'，Main=True 表示 seed 本身（用于蓝底）
-    """
     if extra_anchors is None:
         extra_anchors = []
     group_name = f"{seed.upper()} + Peers"
 
-    # peers（最多 10 个），并补上 anchors（如自定义额外比较）
     peers = get_peers_from_finnhub(seed)
     symbols = [seed.upper()] + [p for p in peers if p] + [a.upper() for a in extra_anchors if a]
 
@@ -163,7 +195,6 @@ def build_group(seed: str, extra_anchors: List[str] = None) -> pd.DataFrame:
         try:
             date_str, h, l, c, prevc = fetch_bar(t)
             P, S1, S2, R1, R2 = pivots(h, l, c)
-            # %Chg：防 0
             chg = (c - prevc) / prevc * 100.0 if (prevc or prevc == 0) and abs(prevc) > 1e-12 else 0.0
 
             rows.append({
@@ -189,7 +220,6 @@ def build_group(seed: str, extra_anchors: List[str] = None) -> pd.DataFrame:
         raise RuntimeError(f"No valid rows for group {seed}")
 
     df = pd.DataFrame(rows)
-    # 主票排最前，然后按 Ticker 排序
     df = df.sort_values(by=["Main", "Ticker"], ascending=[False, True]).reset_index(drop=True)
     return df
 
@@ -215,20 +245,19 @@ def write_csv(groups: List[pd.DataFrame], path: str) -> None:
 def write_pdf(groups: List[pd.DataFrame], path: str) -> None:
     with PdfPages(path) as pdf:
         # 封面
-        plt.figure(figsize=(8.27, 11.69))  # A4 竖
+        plt.figure(figsize=(8.27, 11.69))
         plt.axis("off")
         plt.text(0.5, 0.80, TITLE, ha="center", fontsize=20, fontweight="bold")
         plt.text(0.5, 0.74, SUB, ha="center", fontsize=10)
         plt.text(0.5, 0.69, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", ha="center", fontsize=9)
         pdf.savefig(bbox_inches="tight"); plt.close()
 
-        # 每个分组一页（横）
+        # 每个分组一页
         for g in groups:
             plt.figure(figsize=(11.69, 8.27))
             plt.axis("off")
             group_name = g["Group"].iloc[0]
             plt.text(0.02, 0.97, group_name, fontsize=14, fontweight="bold", va="top")
-            # 表格
             cols = ["Ticker","Date","High","Low","Close","PrevClose","% Chg","Pivot P","S1","S2","R1","R2"]
             table = plt.table(cellText=g[cols].values, colLabels=cols, loc="center")
             table.auto_set_font_size(False)
@@ -238,26 +267,18 @@ def write_pdf(groups: List[pd.DataFrame], path: str) -> None:
     log(f"Wrote {path}")
 
 def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> None:
-    """
-    - group dropdown 筛选
-    - 主票行（Main=True）浅蓝底
-    - 若 |close−S1|/close < 2% 或 |close−R1|/close < 2% 则对应单元格浅黄色
-    """
-    # 准备组名与最上方的“快捷 chip”
     group_names = [g["Group"].iloc[0] for g in groups]
-    seeds = [name.split(" + ")[0] for name in group_names]  # NVDA from "NVDA + Peers"
+    seeds = [name.split(" + ")[0] for name in group_names]
     chips_html = "".join([f'<a class="chip" href="#sec_{seed}">{seed}</a>' for seed in seeds])
 
-    # 每组表格 HTML
     def table_html(df: pd.DataFrame) -> str:
         rows = []
         for _, r in df.iterrows():
             close = float(r["Close"])
-            def near_2pct(x):  # 返回 True/False
+            def near_2pct(x):
                 if close == 0 or abs(close) < 1e-12:
                     return False
                 return abs(close - float(x)) / abs(close) < 0.02
-
             cls_main = ' class="main-row"' if bool(r["Main"]) else ""
             cell_s1_cls = ' class="near-cell"' if near_2pct(r["S1"]) else ""
             cell_r1_cls = ' class="near-cell"' if near_2pct(r["R1"]) else ""
@@ -315,21 +336,14 @@ def write_html(groups: List[pd.DataFrame], report_url: str, site_url: str) -> No
     --border: #eee;
     --text: #222;
   }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif;
-    margin: 12px 12px 90px;
-    color: var(--text);
-  }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif;
+         margin: 12px 12px 90px; color: var(--text); }}
   h1 {{ font-size: 1.25rem; margin: 0 0 4px; }}
   .sub {{ color:#666; font-size:.85rem; margin-bottom:10px; }}
   .bar {{ display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }}
-  .btn {{
-    text-decoration:none; padding:9px 12px; border-radius:10px; border:1px solid var(--border);
-  }}
+  .btn {{ text-decoration:none; padding:9px 12px; border-radius:10px; border:1px solid var(--border); }}
   .chips {{ display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 12px; }}
-  .chip {{
-    display:inline-block; padding:6px 10px; border:1px solid var(--border); border-radius:999px; text-decoration:none;
-  }}
+  .chip {{ display:inline-block; padding:6px 10px; border:1px solid var(--border); border-radius:999px; text-decoration:none; }}
   .controls {{ display:flex; gap:8px; align-items:center; margin:8px 0 12px; }}
   select, option {{ font-size: .95rem; }}
   .group {{ margin-top:16px; border-top:1px solid var(--border); padding-top:10px; }}
