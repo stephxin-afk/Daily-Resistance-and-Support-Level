@@ -36,7 +36,7 @@ jobs:
       - name: Generate PDF (and send WeChat/PushPlus)
         env:
           REPORT_URL: ${{ secrets.REPORT_URL }}                # 例：https://<user>.github.io/<repo>/report.pdf
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}# Server酱可选
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }} # Server酱可选
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}        # PushPlus 可选
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}      # 如果你用到了 peers 动态获取
         run: python report.py
