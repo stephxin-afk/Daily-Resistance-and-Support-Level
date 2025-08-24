@@ -41,12 +41,12 @@ jobs:
 
       - name: Run report
         env:
-          FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
-          WECHAT_SCT_SENDKEY:${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN:    ${{ secrets.PUSHPLUS_TOKEN }}
-          REPORT_URL:        ${{ env.REPORT_URL }}
-          SITE_URL:          ${{ env.SITE_URL }}
-          TICKERS:           ${{ github.event.inputs.tickers }}
+          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN:     ${{ secrets.PUSHPLUS_TOKEN }}
+          REPORT_URL:         ${{ env.REPORT_URL }}
+          SITE_URL:           ${{ env.SITE_URL }}
+          TICKERS:            ${{ github.event.inputs.tickers }}
         run: |
           set -e
           python report.py
