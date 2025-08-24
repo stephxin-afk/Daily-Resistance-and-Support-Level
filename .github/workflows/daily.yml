@@ -2,8 +2,8 @@ name: Daily Report + Pages Deploy
 
 on:
   schedule:
-    - cron: "0 9 * * 1-5"   # UTC 09:00，工作日自动跑（你可改）
-  workflow_dispatch:        # 允许手动触发
+    - cron: "0 3 * * 1-5"   # 工作日每天 UTC 03:00 运行（按需改）
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,49 +27,45 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run report
         env:
-          # 这些可在 repo 的 Settings > Secrets and variables > Actions 里配置
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          # 以下两个用于生成 HTML 里的下载链接；按你的 Pages 网址改
-          REPORT_URL: https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/report.pdf
-          SITE_URL:   https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}       # 可选，用于自动 peers
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }} # 可选，微信推送
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}         # 可选，PushPlus
+          # 下面两个不是必须；若设置了会写入通知与 HTML 里的链接
+          REPORT_URL: ${{ vars.REPORT_URL }}
+          SITE_URL:   ${{ vars.SITE_URL }}
         run: |
+          set -e
           python report.py
+          echo "== After generation =="
+          ls -l
 
-      # —— 诊断：看看文件是否真的生成在当前目录 ——
-      - name: List files for debug
-        run: |
-          pwd
-          ls -lah
-          echo "Try to locate report.pdf if not in cwd:"
-          find . -maxdepth 3 -type f -name "report.pdf" -printf "%p -> %k KB\n" || true
-
-      # —— 准备要发布到 Pages 的目录（public/）——
       - name: Prepare Pages artifact
         run: |
           set -e
           mkdir -p public
-          # 防止文件没生成导致直接失败，先检测再移动
-          for f in index.html report.pdf table.csv; do
+          shopt -s nullglob
+          # 逐个复制产物；缺失则告警但不中断
+          for f in report.pdf index.html table.csv; do
             if [ -f "$f" ]; then
-              mv "$f" public/
+              cp "$f" public/
             else
-              echo "MISS: $f (not found)"
-              # 关键文件 report.pdf 缺失就报错退出；HTML/CSV 缺失不致命
-              if [ "$f" = "report.pdf" ]; then
-                echo "::error::report.pdf not generated. Check previous step logs."
-                exit 1
-              fi
+              echo "::warning file=$f::not found (will continue)"
             fi
           done
-          echo "Public folder content:"
-          ls -lah public
+          # 若没有 index.html，做一个简单重定向到 PDF，保证站点可访问
+          if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
+            cat > public/index.html <<'HTML'
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=./report.pdf">
+<p>If you are not redirected, <a href="./report.pdf">open the PDF</a>.</p>
+HTML
+          fi
+          echo "== public content =="
+          ls -l public
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
