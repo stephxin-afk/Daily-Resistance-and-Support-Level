@@ -1,75 +1,479 @@
-name: Daily Report + Pages Deploy
+# -*- coding: utf-8 -*-
+"""
+Daily Pivot Levels with Peers
+-----------------------------
+Generates:
+- report.pdf   (A4 cover + landscape table page)
+- index.html   (mobile-friendly responsive table)
+- table.csv    (raw data download)
 
-on:
-  schedule:
-    - cron: "30 7 * * *"     # 每天 UTC 07:30
-  workflow_dispatch:
-    inputs:
-      tickers:
-        description: "Override tickers, comma-separated (e.g. NVDA,AMD,TSM)"
-        required: false
-        default: ""
+Ticker sources (优先级):
+1) env TICKERS (逗号分隔)
+2) seeds.yaml / seeds.json (可选)
+3) env DEFAULT_TICKERS (来自 GitHub Variables)
+4) 代码内 DEFAULT_TICKERS 常量 (兜底)
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+Peers:
+- 若设置 FINNHUB_API_KEY (Secrets)，为每个种子 ticker 调 Finnhub peers，并做 profile2 过滤（USD & 主板）
+- peers 去重，最多每个种子补若干个 (MAX_PEERS_PER_SEED)
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
+Optional env:
+- FINNHUB_API_KEY
+- TICKERS (逗号分隔)
+- DEFAULT_TICKERS (逗号分隔)   # 建议由 workflow 注入 vars.DEFAULT_TICKERS
+- REPORT_URL  (如 https://<user>.github.io/<repo>/report.pdf)
+- SITE_URL    (如 https://<user>.github.io/<repo>/)
+- WECHAT_SCT_SENDKEY    (ServerChan Turbo)
+- PUSHPLUS_TOKEN        (PushPlus)
 
-env:
-  REPORT_URL: ${{ vars.REPORT_URL }}
-  SITE_URL: ${{ vars.SITE_URL }}
+Deps: yfinance, pandas, matplotlib, requests, pyyaml (可选，读 seeds.yaml)
+"""
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+import os
+import sys
+import json
+import time
+import traceback
+from datetime import datetime
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# third-party
+import requests
+import pandas as pd
+import yfinance as yf
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+# 尝试读 seeds.yaml
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
-      - name: Run report
-        env:
-          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN:     ${{ secrets.PUSHPLUS_TOKEN }}
-          REPORT_URL:         ${{ env.REPORT_URL }}
-          SITE_URL:           ${{ env.SITE_URL }}
-          TICKERS:            ${{ github.event.inputs.tickers }}
-        run: |
-          set -e
-          python report.py
-          echo "== after generation =="
-          ls -l
+# -------------------- Page & Output Config --------------------
+TITLE = "Daily Pivot Levels (Ticker + Peers)"
+SUB   = "Formulas: P=(H+L+C)/3; S1=2P-H; S2=P-(H-L); R1=2P-L; R2=P+(H-L)"
+OUT_PDF = "report.pdf"
+OUT_HTML = "index.html"
+OUT_CSV = "table.csv"
 
-      - name: Pack Pages
-        run: |
-          bash scripts/pack_pages.sh
+# 兜底券单
+DEFAULT_TICKERS_CONST = ["NVDA", "AMD", "AVGO", "QCOM", "TXN", "MU"]
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./public
-          name: github-pages
-          retention-days: 1
+# 每个种子最多补多少 peers
+MAX_PEERS_PER_SEED = 5
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+# 过滤条件（放宽/收紧可按需调整）
+ALLOWED_CCY = {"USD"}
+ALLOWED_EXCH = {
+    "NASDAQ", "NASDAQ NMS", "NASDAQ/NGS (GLOBAL SELECT MARKET)", "NasdaqGS",
+    "NYSE", "NYSE MKT", "BATS", "AMEX"
+}
+
+# 让负号能正确显示
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+# -------------------- Helpers --------------------
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def get_env(name, default=""):
+    v = os.getenv(name, default)
+    if v is None:
+        v = default
+    return str(v).strip()
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+# -------------------- Seeds --------------------
+def load_seeds():
+    """
+    尝试读取 seeds.yaml 或 seeds.json
+    允许三种结构：
+    1) ["NVDA","AMD",...]
+    2) {"tickers": ["NVDA","AMD",...]}
+    3) {"groups": [{"name":"A","tickers":[...]}], ...}  -> 合并所有 groups 的 tickers
+    """
+    # yaml
+    if yaml:
+        for p in ("seeds.yaml", "seeds.yml"):
+            if os.path.exists(p):
+                try:
+                    obj = yaml.safe_load(read_text(p)) or {}
+                    tks = _normalize_seeds_object(obj)
+                    if tks:
+                        log(f"[seeds] from {p}: {tks}")
+                        return tks
+                except Exception as e:
+                    log(f"[seeds] yaml error: {e}")
+                    break  # 避免重复报错
+    # json
+    for p in ("seeds.json",):
+        if os.path.exists(p):
+            try:
+                obj = json.loads(read_text(p) or "{}")
+                tks = _normalize_seeds_object(obj)
+                if tks:
+                    log(f"[seeds] from {p}: {tks}")
+                    return tks
+            except Exception as e:
+                log(f"[seeds] json error: {e}")
+                break
+    return []
+
+
+def _normalize_seeds_object(obj):
+    if not obj:
+        return []
+    if isinstance(obj, list):
+        return [str(x).strip().upper() for x in obj if str(x).strip()]
+    if isinstance(obj, dict):
+        if "tickers" in obj and isinstance(obj["tickers"], list):
+            return [str(x).strip().upper() for x in obj["tickers"] if str(x).strip()]
+        if "groups" in obj and isinstance(obj["groups"], list):
+            out = []
+            for g in obj["groups"]:
+                xs = g.get("tickers") if isinstance(g, dict) else None
+                if isinstance(xs, list):
+                    out.extend([str(x).strip().upper() for x in xs if str(x).strip()])
+            return list(dict.fromkeys(out))
+    return []
+
+
+# -------------------- Finnhub peers --------------------
+def finnhub_get_peers(symbol: str, token: str):
+    """获取 peers 并用 profile2 做基本过滤，返回去重后的 peers 列表（不含自身）"""
+    try:
+        peers = []
+        url = f"https://finnhub.io/api/v1/stock/peers?symbol={symbol}&token={token}"
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        arr = r.json() or []
+        if not isinstance(arr, list):
+            return []
+        # 过滤自身+规范化
+        arr = [str(p).upper() for p in arr if isinstance(p, str) and p.strip()]
+        arr = [p for p in arr if p != symbol.upper()]
+        kept = []
+        for p in arr:
+            try:
+                prof = requests.get(
+                    f"https://finnhub.io/api/v1/stock/profile2?symbol={p}&token={token}",
+                    timeout=8
+                )
+                if prof.ok:
+                    j = prof.json() or {}
+                    ccy = str(j.get("currency") or "").upper()
+                    exch = str(j.get("exchange") or "")
+                    # 仅做宽松过滤，避免漏掉
+                    if (not ccy or ccy in ALLOWED_CCY) and (not exch or exch in ALLOWED_EXCH):
+                        kept.append(p)
+                if len(kept) >= MAX_PEERS_PER_SEED:
+                    break
+            except Exception:
+                pass
+        log(f"[peers] {symbol}: keep={kept}")
+        return kept
+    except Exception as e:
+        log(f"[peers] error for {symbol}: {e}")
+        return []
+
+
+# -------------------- Choose tickers --------------------
+def choose_tickers():
+    """
+    优先级：
+    1) env TICKERS（workflow 注入，或手动设置运行时的 Input）
+    2) seeds.yaml / seeds.json
+    3) env DEFAULT_TICKERS（来自仓库 Variables，经由 workflow 注入到 env）
+    4) 代码内 DEFAULT_TICKERS_CONST
+    然后为每个种子追加 peers（若有 FINNHUB_API_KEY）
+    """
+    # 1) 明确传入
+    env_raw = get_env("TICKERS")
+    if env_raw:
+        tickers = [t.strip().upper() for t in env_raw.split(",") if t.strip()]
+        log(f"[env] TICKERS={tickers}")
+    else:
+        tickers = []
+
+    # 2) seeds
+    if not tickers:
+        tickers = load_seeds()
+
+    # 3) Variables: DEFAULT_TICKERS
+    if not tickers:
+        raw = get_env("DEFAULT_TICKERS")
+        if raw:
+            tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+            log(f"[vars] DEFAULT_TICKERS={tickers}")
+
+    # 4) 兜底
+    if not tickers:
+        tickers = list(DEFAULT_TICKERS_CONST)
+        log(f"[default] using DEFAULT_TICKERS_CONST={tickers}")
+
+    # peers 追加
+    key = get_env("FINNHUB_API_KEY")
+    final, seen = [], set()
+    for s in tickers:
+        if s not in seen:
+            final.append(s); seen.add(s)
+        if key:
+            for p in finnhub_get_peers(s, key):
+                if p not in seen:
+                    final.append(p); seen.add(p)
+
+    log(f"[tickers] final={final}")
+    return final
+
+
+# -------------------- Data & Calc --------------------
+def pivots(h, l, c):
+    P = (h + l + c) / 3.0
+    R1 = 2 * P - l
+    S1 = 2 * P - h
+    R2 = P + (h - l)
+    S2 = P - (h - l)
+    return P, S1, S2, R1, R2
+
+
+def fetch_latest_row(ticker):
+    """
+    返回最近一个交易日的 High/Low/Close，另带前收 PrevClose 与涨跌幅 ChangePct
+    """
+    df = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
+    if df is None or df.empty or len(df) < 1:
+        raise RuntimeError(f"yfinance empty for {ticker}")
+    last = df.tail(1)
+    # 前一个交易日
+    prev = df.tail(2).head(1) if len(df) >= 2 else None
+
+    last_row = last.reset_index(drop=False).iloc[0]
+    h = float(last_row["High"])
+    l = float(last_row["Low"])
+    c = float(last_row["Close"])
+
+    prev_close = float(prev["Close"].iloc[0]) if prev is not None and not prev.empty else None
+    chg_pct = None
+    if prev_close and prev_close != 0:
+        chg_pct = (c / prev_close - 1.0) * 100.0
+
+    dt = last_row["Date"] if "Date" in last_row else last.index[-1]
+    date_str = dt.date().isoformat() if hasattr(dt, "date") else str(dt)[:10]
+
+    return {
+        "Ticker": ticker,
+        "Date": date_str,
+        "High": h,
+        "Low": l,
+        "Close": c,
+        "PrevClose": prev_close,
+        "ChangePct": chg_pct
+    }
+
+
+def build_table(tickers):
+    rows = []
+    for t in tickers:
+        try:
+            r = fetch_latest_row(t)
+            P, S1, S2, R1, R2 = pivots(r["High"], r["Low"], r["Close"])
+            r.update({
+                "Pivot P": round(P, 2), "S1": round(S1, 2), "S2": round(S2, 2),
+                "R1": round(R1, 2), "R2": round(R2, 2),
+                "High": round(r["High"], 2), "Low": round(r["Low"], 2), "Close": round(r["Close"], 2),
+                "PrevClose": round(r["PrevClose"], 2) if r["PrevClose"] is not None else None,
+                "% Chg": (f"{r['ChangePct']:.2f}%" if r["ChangePct"] is not None else "")
+            })
+            rows.append(r)
+        except Exception as e:
+            log(f"[data] {t} failed: {e}")
+
+    if not rows:
+        raise RuntimeError("No rows collected. Check network or tickers.")
+
+    cols = ["Ticker", "Date", "High", "Low", "Close", "PrevClose", "% Chg", "Pivot P", "S1", "S2", "R1", "R2"]
+    df = pd.DataFrame(rows)[cols].sort_values(["Ticker"], ascending=True).reset_index(drop=True)
+    return df
+
+
+# -------------------- Outputs --------------------
+def write_pdf(df, path):
+    """A4 封面（竖） + 表格页（横）"""
+    with PdfPages(path) as pdf:
+        # Cover
+        plt.figure(figsize=(8.27, 11.69))
+        plt.axis("off")
+        plt.text(0.5, 0.80, TITLE, ha="center", fontsize=20, fontweight="bold")
+        plt.text(0.5, 0.73, SUB, ha="center", fontsize=10)
+        plt.text(0.5, 0.68, f'Generated: {datetime.now():%Y-%m-%d %H:%M}', ha="center", fontsize=9)
+        pdf.savefig(bbox_inches="tight"); plt.close()
+
+        # Table
+        plt.figure(figsize=(11.69, 8.27))
+        plt.axis("off")
+        table = plt.table(cellText=df.values, colLabels=df.columns, loc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.15, 1.35)
+        pdf.savefig(bbox_inches="tight"); plt.close()
+
+
+def write_html(df, pdf_url):
+    """移动端友好，带下载按钮"""
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{TITLE}</title>
+<style>
+  :root {{ --radius:14px; }}
+  body {{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans",sans-serif; margin: 16px; }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 8px; }}
+  .sub {{ color:#666; font-size:.85rem; margin-bottom:12px; }}
+  .bar {{ display:flex; gap:10px; margin:12px 0; flex-wrap:wrap; }}
+  a.btn {{ text-decoration:none; padding:10px 14px; border-radius:var(--radius); border:1px solid #ddd; background:#fff; }}
+  a.btn:hover {{ background:#f8f8f8; }}
+  .table-wrap {{ overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid #eee; border-radius:var(--radius); }}
+  table {{ border-collapse:collapse; width:100%; font-size:14px; }}
+  th, td {{ white-space:nowrap; padding:10px 12px; border-bottom:1px solid #f0f0f0; }}
+  th {{ position:sticky; top:0; background:#fafafa; text-align:left; }}
+  td.pos {{ color:#0a8f3c; font-weight:600; }}
+  td.neg {{ color:#c0362c; font-weight:600; }}
+  @media (max-width:480px) {{
+    table {{ font-size:13px; }}
+    th, td {{ padding:8px 10px; }}
+  }}
+</style>
+</head>
+<body>
+  <h1>{TITLE}</h1>
+  <div class="sub">{SUB}</div>
+  <div class="bar">
+    <a class="btn" href="{pdf_url}">📄 Download PDF</a>
+    <a class="btn" href="table.csv">⬇️ Download CSV</a>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>{"".join(f"<th>{c}</th>" for c in df.columns)}</tr>
+      </thead>
+      <tbody>
+        {rows_html(df)}
+      </tbody>
+    </table>
+  </div>
+  <div class="sub" style="margin-top:10px;color:#888;">Updated at: {datetime.now():%Y-%m-%d %H:%M}</div>
+</body>
+</html>"""
+    with open(OUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def rows_html(df: pd.DataFrame) -> str:
+    out = []
+    for _, row in df.iterrows():
+        tds = []
+        for col in df.columns:
+            val = row[col]
+            if col == "% Chg" and isinstance(val, str) and val.endswith("%"):
+                try:
+                    num = float(val.strip("%"))
+                    cls = "pos" if num >= 0 else "neg"
+                    tds.append(f'<td class="{cls}">{val}</td>')
+                    continue
+                except Exception:
+                    pass
+            tds.append(f"<td>{val}</td>")
+        out.append("<tr>" + "".join(tds) + "</tr>")
+    return "\n".join(out)
+
+
+# -------------------- Notifications (optional) --------------------
+def push_serverchan(sendkey, title, content_md):
+    if not sendkey:
+        log("[SCT] skipped: no key")
+        return False
+    try:
+        r = requests.post(
+            f"https://sctapi.ftqq.com/{sendkey}.send",
+            data={"title": title, "desp": content_md},
+            timeout=15,
+        )
+        log(f"[SCT] HTTP {r.status_code} | {r.text[:200]}")
+        r.raise_for_status()
+        return r.ok
+    except Exception as e:
+        log(f"[SCT] error: {e}")
+        return False
+
+
+def push_pushplus(token, title, content_html):
+    if not token:
+        log("[PushPlus] skipped: no token")
+        return False
+    try:
+        r = requests.post(
+            "https://www.pushplus.plus/send",
+            json={"token": token, "title": title, "content": content_html, "template": "html"},
+            timeout=15,
+        )
+        log(f"[PushPlus] HTTP {r.status_code} | {r.text[:200]}")
+        r.raise_for_status()
+        return r.ok
+    except Exception as e:
+        log(f"[PushPlus] error: {e}")
+        return False
+
+
+# -------------------- Main --------------------
+if __name__ == "__main__":
+    try:
+        # 1) 选券 & peers
+        tickers = choose_tickers()
+
+        # 2) 构建表格
+        df = build_table(tickers)
+        log(f"[rows] {len(df)}")
+
+        # 3) 输出
+        df.to_csv(OUT_CSV, index=False); log(f"wrote {OUT_CSV}")
+        write_pdf(df, OUT_PDF);          log(f"wrote {OUT_PDF}")
+
+        report_url = get_env("REPORT_URL") or OUT_PDF
+        write_html(df, report_url);      log(f"wrote {OUT_HTML}")
+
+        # 4) 推送（可选）
+        site_url = get_env("SITE_URL")
+        title = "Daily Pivot Levels — Ticker + Peers"
+
+        md_msg = (
+            f"**{title}**\n\n"
+            + (f"[📱 Online view]({site_url})\n\n" if site_url else "")
+            + f"[📄 Download PDF]({report_url})"
+        )
+        html_msg = (
+            f"<b>{title}</b><br>"
+            + (f"<a href=\"{site_url}\">📱 Online view</a><br>" if site_url else "")
+            + f"<a href='{report_url}'>📄 Download PDF</a>"
+        )
+
+        ok_sct = push_serverchan(get_env("WECHAT_SCT_SENDKEY"), title, md_msg)
+        ok_pp  = push_pushplus(get_env("PUSHPLUS_TOKEN"), title, html_msg)
+        log(f"[notify] ServerChan={ok_sct}  PushPlus={ok_pp}")
+
+    except Exception:
+        log("FATAL ERROR:\n" + "".join(traceback.format_exception(*sys.exc_info())))
+        raise
