@@ -1,17 +1,18 @@
-name: Daily Report + Pages Deploy
+name: Daily Report + Pages
 
 on:
-  schedule:
-    - cron: "0 3 * * 1-5"   # 工作日 UTC 03:00（按需改）
-  workflow_dispatch:
+  workflow_dispatch:            # 手动触发
+  schedule:                     # 工作日每天 09:00 北京时间（01:00 UTC）
+    - cron: '0 1 * * 1-5'
 
+# 允许部署到 GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: 'pages'
   cancel-in-progress: false
 
 jobs:
@@ -24,47 +25,35 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run report
-        env:
-          FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN:    ${{ secrets.PUSHPLUS_TOKEN }}
-          REPORT_URL:        ${{ vars.REPORT_URL }}
-          SITE_URL:          ${{ vars.SITE_URL }}
+      # 计算站点 URL / 报告直链（支持 schedule 触发）
+      - name: Compute URLs
         run: |
-          set -e
-          python report.py
-          echo "== After generation =="
-          ls -l
+          echo "REPO_NAME=${GITHUB_REPOSITORY#*/}" >> $GITHUB_ENV
+          echo "SITE_URL=https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/" >> $GITHUB_ENV
+          echo "REPORT_URL=https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/report.pdf" >> $GITHUB_ENV
+          echo "SITE_URL=$SITE_URL"
+          echo "REPORT_URL=$REPORT_URL"
 
-      - name: Prepare Pages artifact
+      - name: Run report.py (generate PDF/HTML/CSV + push notifications)
+        env:
+          # 供 report.py 使用（会写到微信推送中）
+          SITE_URL: ${{ env.SITE_URL }}
+          REPORT_URL: ${{ env.REPORT_URL }}
+          # 推送/数据的可选密钥（在仓库 Settings → Secrets and variables → Actions 添加）
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN:     ${{ secrets.PUSHPLUS_TOKEN }}
+          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+        run: python report.py
+
+      - name: Move outputs to public
         run: |
-          set -e
           mkdir -p public
-          shopt -s nullglob
-          # 逐个复制产物；缺失则告警但不中断
-          for f in report.pdf index.html table.csv; do
-            if [ -f "$f" ]; then
-              cp "$f" public/
-            else
-              echo "::warning file=$f::not found (will continue)"
-            fi
-          done
-          # 若没有 index.html，生成一个重定向到 PDF 的简页
-          if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
-            printf '%s\n' \
-              '<!doctype html><meta charset="utf-8">' \
-              '<meta http-equiv="refresh" content="0; url=./report.pdf">' \
-              '<p>If you are not redirected, <a href="./report.pdf">open the PDF</a>.</p>' \
-              > public/index.html
-          fi
-          echo "== public content =="
-          ls -l public
+          mv report.pdf index.html table.csv public/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
