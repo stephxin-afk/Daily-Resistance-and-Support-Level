@@ -2,7 +2,7 @@ name: Daily Report + Pages Deploy
 
 on:
   schedule:
-    - cron: "0 1 * * 1-5"   # 按需调整；这里是 UTC 每个工作日 01:00
+    - cron: "0 1 * * 1-5"   # UTC 工作日 01:00，按需改
   workflow_dispatch: {}
   push:
     paths:
@@ -35,41 +35,39 @@ jobs:
 
       - name: Run report.py
         env:
-          # —— Secrets（可选，有就会用）——
-          FINNHUB_API_KEY:        ${{ secrets.FINNHUB_API_KEY }}
-          WECHAT_SCT_SENDKEY:     ${{ secrets.WECHAT_SCT_SENDKEY }}
-          PUSHPLUS_TOKEN:         ${{ secrets.PUSHPLUS_TOKEN }}
-          # —— Variables（可选）——
-          TICKERS:                ${{ vars.TICKERS }}
-          DEFAULT_TICKERS:        ${{ vars.DEFAULT_TICKERS }}
-          SITE_URL:               ${{ vars.SITE_URL }}
-          REPORT_URL:             ${{ vars.REPORT_URL }}
+          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN:     ${{ secrets.PUSHPLUS_TOKEN }}
+          TICKERS:            ${{ vars.TICKERS }}
+          DEFAULT_TICKERS:    ${{ vars.DEFAULT_TICKERS }}
+          SITE_URL:           ${{ vars.SITE_URL }}
+          REPORT_URL:         ${{ vars.REPORT_URL }}
+        shell: bash
         run: |
+          set -euo pipefail
           python report.py
-          echo "== after generation =="
-          ls -l
+          echo "== after generation ==" && ls -l
 
       - name: Prepare Pages artifact
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p public
           shopt -s nullglob
           for f in index.html report.pdf table.csv; do
-            if [ -f "$f" ]; then
-              cp "$f" public/
-            fi
+            if [ -f "$f" ]; then cp "$f" public/; fi
           done
 
-          # 若没有 index.html 但有 PDF，则生成一个简单跳转页
+          # 若没有 index.html 但有 PDF，生成一个极简跳转页（用 printf 避免 here-doc/YAML 缩进问题）
           if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
-            cat > public/index.html <<'HTML'
-<!doctype html><meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url=./report.pdf">
-If you are not redirected, <a href="./report.pdf">open the PDF</a>.
-HTML
+            printf '%s\n' \
+              '<!doctype html><meta charset="utf-8">' \
+              '<meta http-equiv="refresh" content="0; url=./report.pdf">' \
+              'If you are not redirected, <a href="./report.pdf">open the PDF</a>.' \
+              > public/index.html
           fi
 
-          echo "== public content =="
-          ls -l public
+          echo "== public content ==" && ls -l public
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
