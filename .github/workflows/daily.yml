@@ -53,13 +53,11 @@ jobs:
           echo "== After generation =="
           ls -l
 
-      - name: Prepare Pages artifact
+      - name: Prepare Pages artifact (copy files)
         run: |
           set -e
           mkdir -p public
           shopt -s nullglob
-
-          # 拷贝期望产物（存在就拷贝，不存在仅警告）
           for f in report.pdf index.html table.csv; do
             if [ -f "$f" ]; then
               cp "$f" public/
@@ -67,19 +65,24 @@ jobs:
               echo "::warning::missing $f (will continue)"
             fi
           done
+          echo "== public content =="
+          ls -l public
 
-          # 若没有 index.html 但有 PDF，生成一个最简跳转页
+      # 单独一步来写兜底 index.html，避免在同一 run: 块里混入 HTML 触发 YAML 解析问题
+      - name: Create fallback index.html when PDF exists
+        run: |
+          set -e
           if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
-            HTML_CONTENT='<!doctype html>
+            cat > public/index.html <<'HTML'
+<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Report</title>
 <p>If you are not redirected, <a href="./report.pdf">open the PDF</a>.</p>
-<script>location.href="./report.pdf";</script>'
-            printf "%s\n" "$HTML_CONTENT" > public/index.html
+<script>location.href="./report.pdf";</script>
+HTML
           fi
-
-          echo "== public content =="
+          echo "== final public content =="
           ls -l public
 
       - name: Upload Pages artifact
