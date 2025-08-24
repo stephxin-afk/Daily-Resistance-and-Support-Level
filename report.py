@@ -264,29 +264,26 @@ if __name__ == "__main__":
         write_html(df, OUTDIR, PDF_NAME);           log("Wrote index.html")
 
         # 4) Notifications
-        site_url   = get_env("SITE_URL")  # e.g. https://user.github.io/repo/
-        report_url = get_env("REPORT_URL")
-        if not report_url and site_url:
-            report_url = site_url.rstrip("/") + f"/{PDF_NAME}"
-        if not report_url:
-            report_url = PDF_NAME  # relative (works on the site)
-
+        site_url = get_env("SITE_URL")      # 例如 https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level
+        report_url = get_env("REPORT_URL") or "report.pdf"  # 强烈建议设成绝对URL
         title = "NVDA & Peers — Daily Pivot Levels"
+
+        # 让 PDF 链接放在第一位，并附上纯文本 URL，方便长按复制/直接点
         md_msg = (
-            f"**{title}**\n\n"
+            f"[📄 Download PDF]({report_url})\n\n"
             + (f"[📱 Online view]({site_url})\n\n" if site_url else "")
-            + f"[📄 Download PDF]({report_url})"
+            + f"{report_url}"
         )
         html_msg = (
-            f"<b>{title}</b><br>"
-            + (f"<a href=\"{site_url}\">📱 Online view</a><br>" if site_url else "")
-            + f"<a href='{report_url}'>📄 Download PDF</a>"
+            f"<a href='{report_url}'>📄 Download PDF</a><br>"
+            + (f"<a href='{site_url}'>📱 Online view</a><br>" if site_url else "")
+            + f"{report_url}"
         )
 
         ok_sct = push_serverchan(get_env("WECHAT_SCT_SENDKEY"), title, md_msg)
         ok_pp  = push_pushplus(get_env("PUSHPLUS_TOKEN"), title, html_msg)
         log(f"[Notify] ServerChan={ok_sct}  PushPlus={ok_pp}")
-
+   
     except Exception as e:
         log("FATAL ERROR:\n" + "".join(traceback.format_exception(*sys.exc_info())))
         raise
