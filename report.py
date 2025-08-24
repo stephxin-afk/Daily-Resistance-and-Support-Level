@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Generates:
+Outputs to ./public/ :
 - report.pdf   (A4 cover + landscape table page)
-- index.html   (mobile-friendly responsive table)
-- table.csv    (raw data download)
+- index.html   (responsive table, mobile-friendly)
+- table.csv    (raw data)
 
 Optional env:
 - FINNHUB_API_KEY   to fetch dynamic peers
-- REPORT_URL        e.g. https://<user>.github.io/<repo>/report.pdf
-- SITE_URL          e.g. https://<user>.github.io/<repo>/
+- REPORT_URL        absolute PDF url; if missing but SITE_URL exists, will use SITE_URL/report.pdf
+- SITE_URL          site root, e.g. https://<user>.github.io/<repo>/
 - WECHAT_SCT_SENDKEY (ServerChan Turbo)
 - PUSHPLUS_TOKEN     (PushPlus)
 
@@ -17,8 +17,6 @@ Deps: yfinance, pandas, matplotlib, requests
 
 import os
 import sys
-import json
-import time
 import traceback
 from datetime import datetime
 
@@ -32,7 +30,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 # -------------------- Config --------------------
 TITLE = "NVDA & Peers: Daily Support/Resistance (Pivot Method)"
 SUB   = "Formulas: P=(H+L+C)/3; S1=2P-H; S2=P-(H-L); R1=2P-L; R2=P+(H-L)"
-OUT   = "report.pdf"
+OUTDIR = "public"
+PDF_NAME = "report.pdf"
 
 # Fallback peers when no API key or API fails
 FALLBACK_TICKERS = ["NVDA", "AMD", "TSM", "AVGO", "INTC"]
@@ -45,7 +44,6 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
-
 
 def get_env(name, default=""):
     v = os.getenv(name, default)
@@ -70,7 +68,6 @@ def get_peers_from_finnhub(symbol="NVDA"):
         r.raise_for_status()
         peers = r.json()
         if isinstance(peers, list):
-            # Finnhub may return the symbol itself in the list; ensure unique + keep reasonable length
             peers = [p for p in peers if isinstance(p, str) and p.upper() != symbol.upper()]
             log(f"Finnhub peers for {symbol}: {peers[:10]}")
             return peers
@@ -91,19 +88,28 @@ def pivots(h, l, c):
 
 
 def fetch_latest_row(ticker):
-    """Return dict with High/Low/Close for the most recent daily bar."""
-    df = yf.download(ticker, period="7d", interval="1d", auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        raise RuntimeError(f"yfinance returned empty for {ticker}")
-    last = df.tail(1).reset_index(drop=False).iloc[0]
-    # Convert to float explicitly (avoid FutureWarning)
+    """Return dict with High/Low/Close for the most recent daily bar (+ prev close)."""
+    df = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
+    if df is None or df.empty or len(df) < 2:
+        raise RuntimeError(f"yfinance returned insufficient data for {ticker}")
+    last2 = df.tail(2).reset_index(drop=False)
+    last = last2.iloc[1]
+    prev = last2.iloc[0]
+
+    # Explicit float conversion
     h = float(last["High"])
     l = float(last["Low"])
     c = float(last["Close"])
+    pc = float(prev["Close"])
+
     # Date string
     dt = last["Date"] if "Date" in last else df.index[-1]
     date_str = dt.date().isoformat() if hasattr(dt, "date") else str(dt)[:10]
-    return {"Ticker": ticker, "Date": date_str, "High": h, "Low": l, "Close": c}
+
+    # change %
+    chg_pct = (c - pc) / pc * 100.0 if pc != 0 else 0.0
+
+    return {"Ticker": ticker, "Date": date_str, "High": h, "Low": l, "Close": c, "Change %": chg_pct}
 
 
 def build_table(tickers):
@@ -115,20 +121,22 @@ def build_table(tickers):
             r.update({
                 "Pivot P": round(P, 2), "S1": round(S1, 2), "S2": round(S2, 2),
                 "R1": round(R1, 2), "R2": round(R2, 2),
-                "High": round(r["High"], 2), "Low": round(r["Low"], 2), "Close": round(r["Close"], 2)
+                "High": round(r["High"], 2), "Low": round(r["Low"], 2), "Close": round(r["Close"], 2),
+                "Change %": round(r["Change %"], 2),
             })
             rows.append(r)
         except Exception as e:
             log(f"Fetch failed for {t}: {e}")
     if not rows:
         raise RuntimeError("No rows collected. Check network or tickers.")
-    cols = ["Ticker", "Date", "High", "Low", "Close", "Pivot P", "S1", "S2", "R1", "R2"]
+    cols = ["Ticker", "Date", "High", "Low", "Close", "Change %", "Pivot P", "S1", "S2", "R1", "R2"]
     return pd.DataFrame(rows)[cols].sort_values(["Ticker"], ascending=True).reset_index(drop=True)
 
 
 # -------------------- Outputs: PDF / HTML / CSV --------------------
 def write_pdf(df, path):
-    """A4 cover (portrait) + table page (landscape), tighter margins for readability."""
+    """A4 cover (portrait) + table page (landscape)."""
+    from matplotlib.backends.backend_pdf import PdfPages
     with PdfPages(path) as pdf:
         # Cover (A4 portrait: 8.27 x 11.69 inches)
         plt.figure(figsize=(8.27, 11.69))
@@ -144,12 +152,12 @@ def write_pdf(df, path):
         table = plt.table(cellText=df.values, colLabels=df.columns, loc="center")
         table.auto_set_font_size(False)
         table.set_fontsize(11)
-        table.scale(1.2, 1.4)  # enlarge for small screens
+        table.scale(1.2, 1.4)
         pdf.savefig(bbox_inches="tight"); plt.close()
 
 
-def write_html(df, pdf_url):
-    """Responsive, mobile-friendly index.html with sticky header and horizontal scroll."""
+def write_html(df, outdir, pdf_name):
+    """Responsive index.html with sticky header + horizontal scroll."""
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -176,7 +184,7 @@ def write_html(df, pdf_url):
   <h1>{TITLE}</h1>
   <div class="sub">{SUB}</div>
   <div class="bar">
-    <a class="btn" href="{pdf_url}">📄 Download PDF</a>
+    <a class="btn" href="{pdf_name}">📄 Download PDF</a>
     <a class="btn" href="table.csv">⬇️ Download CSV</a>
   </div>
   <div class="table-wrap">
@@ -192,7 +200,7 @@ def write_html(df, pdf_url):
   <div class="sub" style="margin-top:10px;color:#888;">Updated at: {datetime.now():%Y-%m-%d %H:%M}</div>
 </body>
 </html>"""
-    with open("index.html", "w", encoding="utf-8") as f:
+    with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
 
 
@@ -236,6 +244,8 @@ def push_pushplus(token, title, content_html):
 # -------------------- Main --------------------
 if __name__ == "__main__":
     try:
+        os.makedirs(OUTDIR, exist_ok=True)
+
         # 1) Tickers: Finnhub peers (optional) + fallback
         peers = get_peers_from_finnhub("NVDA")
         tickers = ["NVDA"] + peers[:5] if peers else FALLBACK_TICKERS
@@ -245,24 +255,22 @@ if __name__ == "__main__":
         df = build_table(tickers)
         log(f"Rows: {len(df)}")
 
-        # 3) Outputs
-        # CSV for reuse / download
-        df.to_csv("table.csv", index=False)
-        log("Wrote table.csv")
-
-        # PDF (cover + landscape table)
-        write_pdf(df, OUT)
-        log(f"Wrote {OUT}")
-
-        # HTML (mobile-friendly)
-        report_url = get_env("REPORT_URL") or "report.pdf"
-        write_html(df, report_url)
-        log("Wrote index.html")
+        # 3) Outputs (all into ./public)
+        csv_path = os.path.join(OUTDIR, "table.csv")
+        pdf_path = os.path.join(OUTDIR, PDF_NAME)
+        df.to_csv(csv_path, index=False);           log("Wrote table.csv")
+        write_pdf(df, pdf_path);                    log("Wrote report.pdf")
+        write_html(df, OUTDIR, PDF_NAME);           log("Wrote index.html")
 
         # 4) Notifications
-        site_url = get_env("SITE_URL")  # optional homepage
-        title = "NVDA & Peers — Daily Pivot Levels"
+        site_url   = get_env("SITE_URL")  # e.g. https://user.github.io/repo/
+        report_url = get_env("REPORT_URL")
+        if not report_url and site_url:
+            report_url = site_url.rstrip("/") + f"/{PDF_NAME}"
+        if not report_url:
+            report_url = PDF_NAME  # relative (works on the site)
 
+        title = "NVDA & Peers — Daily Pivot Levels"
         md_msg = (
             f"**{title}**\n\n"
             + (f"[📱 Online view]({site_url})\n\n" if site_url else "")
@@ -280,5 +288,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         log("FATAL ERROR:\n" + "".join(traceback.format_exception(*sys.exc_info())))
-        # Re-raise to fail the workflow, so你能第一时间看到错误
         raise
