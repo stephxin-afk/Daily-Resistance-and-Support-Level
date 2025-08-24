@@ -1,327 +1,91 @@
-# -*- coding: utf-8 -*-
-"""
-Grouped report per seed ticker:
-- Read seeds from env TICKERS (fallback to DEFAULT_TICKERS)
-- For each seed, fetch peers from Finnhub (if FINNHUB_API_KEY is set)
-- Build one table per seed: [seed] + peers (unique), compute pivots and %chg
-- Outputs:
-  report.pdf  (cover + one landscape page per seed)
-  index.html  (one section per seed, responsive)
-  table.csv   (all rows with column 'Group' = '<SEED> + Peers')
+name: Daily Report + Pages Deploy
 
-Optional env:
-- FINNHUB_API_KEY
-- TICKERS            e.g. "AMD, HD"
-- DEFAULT_TICKERS    e.g. "NVDA,AMD"
-- REPORT_URL         e.g. https://<user>.github.io/<repo>/report.pdf
-- SITE_URL           e.g. https://<user>.github.io/<repo>/
-- WECHAT_SCT_SENDKEY (ServerChan Turbo)
-- PUSHPLUS_TOKEN     (PushPlus)
+on:
+  schedule:
+    - cron: "0 1 * * 1-5"   # UTC 工作日 01:00，按需改
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "report.py"
+      - ".github/workflows/daily.yml"
 
-Deps: yfinance, pandas, matplotlib, requests
-"""
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
-import os
-import sys
-import json
-import traceback
-from datetime import datetime
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
-import requests
-import pandas as pd
-import yfinance as yf
-import matplotlib
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-TITLE = "Daily Pivot Levels (Ticker + Peers)"
-SUB   = "Formulas: P=(H+L+C)/3; S1=2P−H; S2=P−(H−L); R1=2P−L; R2=P+(H−L)"
-OUT   = "report.pdf"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-# 渲染减号
-matplotlib.rcParams["axes.unicode_minus"] = False
+      - name: Install deps
+        run: pip install -r requirements.txt
 
-def log(msg: str):
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+      - name: Run report.py
+        env:
+          FINNHUB_API_KEY:    ${{ secrets.FINNHUB_API_KEY }}
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN:     ${{ secrets.PUSHPLUS_TOKEN }}
+          TICKERS:            ${{ vars.TICKERS }}
+          DEFAULT_TICKERS:    ${{ vars.DEFAULT_TICKERS }}
+          SITE_URL:           ${{ vars.SITE_URL }}
+          REPORT_URL:         ${{ vars.REPORT_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python report.py
+          echo "== after generation ==" && ls -l
 
-def getenv(name: str, default: str = "") -> str:
-    v = os.getenv(name, default)
-    return (v or "").strip()
+      - name: Prepare Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          shopt -s nullglob
+          for f in index.html report.pdf table.csv; do
+            if [ -f "$f" ]; then cp "$f" public/; fi
+          done
 
-def parse_seeds() -> list[str]:
-    raw = getenv("TICKERS") or getenv("DEFAULT_TICKERS")
-    if not raw:
-        # 没配置就用 NVDA 作为默认示例
-        raw = "NVDA"
-    # 支持逗号、空格、分号分隔
-    parts = [p.strip().upper() for p in
-             raw.replace(";", ",").replace(" ", ",").split(",") if p.strip()]
-    # 去重但保留顺序
-    seen, out = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p); out.append(p)
-    return out
+          # 若没有 index.html 但有 PDF，生成一个极简跳转页（用 printf 避免 here-doc/YAML 缩进问题）
+          if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
+            printf '%s\n' \
+              '<!doctype html><meta charset="utf-8">' \
+              '<meta http-equiv="refresh" content="0; url=./report.pdf">' \
+              'If you are not redirected, <a href="./report.pdf">open the PDF</a>.' \
+              > public/index.html
+          fi
 
-def get_peers_from_finnhub(symbol: str) -> list[str]:
-    key = getenv("FINNHUB_API_KEY")
-    if not key:
-        return []
-    url = f"https://finnhub.io/api/v1/stock/peers?symbol={symbol}&token={key}"
-    try:
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        peers = r.json()
-        if isinstance(peers, list):
-            peers = [p for p in peers if isinstance(p, str) and p.upper() != symbol.upper()]
-            return peers
-    except Exception as e:
-        log(f"Finnhub peers error for {symbol}: {e}")
-    return []
+          echo "== public content ==" && ls -l public
 
-def pivots(h: float, l: float, c: float):
-    P = (h + l + c) / 3.0
-    R1 = 2 * P - l
-    S1 = 2 * P - h
-    R2 = P + (h - l)
-    S2 = P - (h - l)
-    return P, S1, S2, R1, R2
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+          name: github-pages
+          retention-days: 1
 
-def fetch_latest_row(ticker: str) -> dict:
-    # 取近 14 天，确保能拿到最近两根有效日线
-    df = yf.download(ticker, period="14d", interval="1d", auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        raise RuntimeError(f"yfinance empty for {ticker}")
-    df = df.dropna(subset=["High", "Low", "Close"])
-    if len(df) < 2:
-        raise RuntimeError(f"not enough bars for {ticker}")
-    last2 = df.tail(2).reset_index(drop=False)
-    cur  = last2.iloc[1]
-    prev = last2.iloc[0]
-    # yfinance 有时返回 numpy 类型，用 float() 统一
-    h = float(cur["High"]); l = float(cur["Low"]); c = float(cur["Close"])
-    pc = float(prev["Close"])
-    dt = cur["Date"] if "Date" in cur else df.index[-1]
-    date_str = dt.date().isoformat() if hasattr(dt, "date") else str(dt)[:10]
-    return {"Ticker": ticker, "Date": date_str, "High": h, "Low": l, "Close": c, "PrevClose": pc}
-
-def build_group(seed: str, max_peers: int = 6) -> pd.DataFrame:
-    peers = get_peers_from_finnhub(seed)
-    # peers 限制数量，避免表格太长；优先保留返回顺序
-    peers = [p.upper() for p in peers[:max_peers] if isinstance(p, str)]
-    tickers = [seed.upper()] + [p for p in peers if p != seed.upper()]
-    rows = []
-    for t in tickers:
-        try:
-            r = fetch_latest_row(t)
-            P, S1, S2, R1, R2 = pivots(r["High"], r["Low"], r["Close"])
-            chg_pct = (r["Close"] - r["PrevClose"]) / r["PrevClose"] * 100.0 if r["PrevClose"] else 0.0
-            r.update({
-                "Pivot P": round(P, 2), "S1": round(S1, 2), "S2": round(S2, 2),
-                "R1": round(R1, 2), "R2": round(R2, 2),
-                "High": round(r["High"], 2), "Low": round(r["Low"], 2),
-                "Close": round(r["Close"], 2), "PrevClose": round(r["PrevClose"], 2),
-                "% Chg": round(chg_pct, 2)
-            })
-            rows.append(r)
-        except Exception as e:
-            log(f"Fetch failed for {t}: {e}")
-    if not rows:
-        raise RuntimeError(f"No data for seed {seed}.")
-    cols = ["Ticker", "Date", "High", "Low", "Close", "PrevClose", "% Chg", "Pivot P", "S1", "S2", "R1", "R2"]
-    df = pd.DataFrame(rows)[cols]
-    df.insert(0, "Group", f"{seed.upper()} + Peers")
-    return df
-
-def write_pdf_grouped(grouped: dict[str, pd.DataFrame], path: str):
-    with PdfPages(path) as pdf:
-        # 封面
-        plt.figure(figsize=(8.27, 11.69))  # A4 竖
-        plt.axis("off")
-        plt.text(0.5, 0.80, TITLE, ha="center", fontsize=20, fontweight="bold")
-        plt.text(0.5, 0.73, SUB.replace("−", "-"), ha="center", fontsize=10)
-        plt.text(0.5, 0.68, f'Generated: {datetime.now():%Y-%m-%d %H:%M}', ha="center", fontsize=9)
-        pdf.savefig(bbox_inches="tight"); plt.close()
-
-        # 每个种子单独一页（横向）
-        for seed, df in grouped.items():
-            plt.figure(figsize=(11.69, 8.27))  # A4 横
-            plt.axis("off")
-            title = f"{seed} + Peers"
-            plt.text(0.5, 0.95, title, ha="center", fontsize=16, fontweight="bold")
-            table = plt.table(cellText=df.drop(columns=["Group"]).values,
-                              colLabels=df.drop(columns=["Group"]).columns,
-                              loc="center")
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1.2, 1.3)
-            pdf.savefig(bbox_inches="tight"); plt.close()
-
-def write_csv(df_all: pd.DataFrame, path="table.csv"):
-    df_all.to_csv(path, index=False)
-
-def write_html_grouped(grouped: dict[str, pd.DataFrame], pdf_url: str):
-    # 目录
-    nav = "".join(f'<a class="chip" href="#g-{seed}">{seed}</a>' for seed in grouped.keys())
-    # 每个分区
-    sections = []
-    for seed, df in grouped.items():
-        # 行渲染（涨跌幅上色）
-        body = []
-        cols = list(df.columns)
-        # 显示时不需要 Group 列
-        cols_show = [c for c in cols if c != "Group"]
-        for row in df[cols_show].itertuples(index=False):
-            cells = []
-            for c, v in zip(cols_show, row):
-                if c == "% Chg":
-                    try:
-                        num = float(v)
-                        cls = "up" if num >= 0 else "down"
-                        cells.append(f'<td class="{cls}">{num:.2f}%</td>')
-                    except Exception:
-                        cells.append(f"<td>{v}</td>")
-                else:
-                    cells.append(f"<td>{v}</td>")
-            body.append("<tr>" + "".join(cells) + "</tr>")
-        html_rows = "\n".join(body)
-        thead = "".join(f"<th>{h}</th>" for h in cols_show)
-        sections.append(f"""
-<section id="g-{seed}">
-  <h2>{seed} + Peers</h2>
-  <div class="table-wrap">
-    <table>
-      <thead><tr>{thead}</tr></thead>
-      <tbody>
-        {html_rows}
-      </tbody>
-    </table>
-  </div>
-</section>
-""")
-    html = f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{TITLE}</title>
-<style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif; margin: 16px; }}
-  h1 {{ font-size: 1.25rem; margin: 0 0 6px; }}
-  h2 {{ font-size: 1.05rem; margin: 16px 0 8px; }}
-  .sub {{ color:#666; font-size:.85rem; margin-bottom:10px; }}
-  .bar {{ display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }}
-  a.btn {{ text-decoration:none; padding:10px 14px; border-radius:10px; border:1px solid #ddd; }}
-  .chips {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }}
-  .chip {{ display:inline-block; padding:6px 10px; border:1px solid #eee; border-radius:999px; font-size:.9rem; }}
-  .table-wrap {{ overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid #eee; border-radius:10px; }}
-  table {{ border-collapse:collapse; width:100%; font-size:14px; }}
-  th, td {{ white-space:nowrap; padding:9px 10px; border-bottom:1px solid #f0f0f0; }}
-  th {{ position:sticky; top:0; background:#fafafa; text-align:left; }}
-  td.up {{ color:#14804a; font-weight:600; }}
-  td.down {{ color:#d12c2c; font-weight:600; }}
-  @media (max-width:480px) {{
-    table {{ font-size:13px; }}
-    th, td {{ padding:8px 8px; }}
-  }}
-</style>
-</head>
-<body>
-  <h1>{TITLE}</h1>
-  <div class="sub">{SUB}</div>
-
-  <div class="bar">
-    <a class="btn" href="{pdf_url}">📄 Download PDF</a>
-    <a class="btn" href="table.csv">⬇️ Download CSV</a>
-  </div>
-
-  <div class="chips">
-    {nav}
-  </div>
-
-  {''.join(sections)}
-
-  <div class="sub" style="margin-top:10px;color:#888;">Updated at: {datetime.now():%Y-%m-%d %H:%M}</div>
-</body></html>"""
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(html)
-
-def push_serverchan(sendkey: str, title: str, content_md: str) -> bool:
-    if not sendkey:
-        return False
-    try:
-        r = requests.post(
-            f"https://sctapi.ftqq.com/{sendkey}.send",
-            data={"title": title, "desp": content_md},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.ok
-    except Exception as e:
-        log(f"[SCT] {e}")
-        return False
-
-def push_pushplus(token: str, title: str, content_html: str) -> bool:
-    if not token:
-        return False
-    try:
-        r = requests.post(
-            "https://www.pushplus.plus/send",
-            json={"token": token, "title": title, "content": content_html, "template": "html"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.ok
-    except Exception as e:
-        log(f"[PushPlus] {e}")
-        return False
-
-if __name__ == "__main__":
-    try:
-        seeds = parse_seeds()
-        log(f"Seeds: {seeds}")
-
-        grouped: dict[str, pd.DataFrame] = {}
-        frames = []
-        for seed in seeds:
-            try:
-                df = build_group(seed)
-                grouped[seed] = df
-                frames.append(df)
-                log(f"[{seed}] rows={len(df)}")
-            except Exception as e:
-                log(f"[{seed}] failed: {e}")
-
-        if not frames:
-            raise RuntimeError("No groups built; check seeds and network.")
-
-        df_all = pd.concat(frames, ignore_index=True)
-        write_csv(df_all, "table.csv")
-        log("Wrote table.csv")
-
-        write_pdf_grouped(grouped, OUT)
-        log(f"Wrote {OUT}")
-
-        report_url = getenv("REPORT_URL") or "report.pdf"
-        write_html_grouped(grouped, report_url)
-        log("Wrote index.html")
-
-        # 通知
-        site_url = getenv("SITE_URL")
-        title = "Daily Pivot — Grouped by Seeds"
-        md_msg = (
-            f"**{title}**\n\n"
-            + (f"[📱 Online view]({site_url})\n\n" if site_url else "")
-            + f"[📄 Download PDF]({report_url})"
-        )
-        html_msg = (
-            f"<b>{title}</b><br>"
-            + (f"<a href=\"{site_url}\">📱 Online view</a><br>" if site_url else "")
-            + f"<a href='{report_url}'>📄 Download PDF</a>"
-        )
-        ok_sct = push_serverchan(getenv("WECHAT_SCT_SENDKEY"), title, md_msg)
-        ok_pp  = push_pushplus(getenv("PUSHPLUS_TOKEN"), title, html_msg)
-        log(f"[Notify] ServerChan={ok_sct}  PushPlus={ok_pp}")
-
-    except Exception:
-        log("FATAL ERROR:\n" + "".join(traceback.format_exception(*sys.exc_info())))
-        raise
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
