@@ -2,8 +2,7 @@ name: Daily Report + Pages Deploy
 
 on:
   schedule:
-    # 每天 UTC 07:30 运行（北京时间约 15:30）
-    - cron: "30 7 * * *"
+    - cron: "30 7 * * *"     # 每天 UTC 07:30
   workflow_dispatch:
     inputs:
       tickers:
@@ -17,7 +16,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
 
 env:
@@ -50,40 +49,12 @@ jobs:
         run: |
           set -e
           python report.py
-          echo "== After generation =="
+          echo "== after generation =="
           ls -l
 
-      - name: Prepare Pages artifact (copy files)
+      - name: Pack Pages
         run: |
-          set -e
-          mkdir -p public
-          shopt -s nullglob
-          for f in report.pdf index.html table.csv; do
-            if [ -f "$f" ]; then
-              cp "$f" public/
-            else
-              echo "::warning::missing $f (will continue)"
-            fi
-          done
-          echo "== public content =="
-          ls -l public
-
-      # 单独一步来写兜底 index.html，避免在同一 run: 块里混入 HTML 触发 YAML 解析问题
-      - name: Create fallback index.html when PDF exists
-        run: |
-          set -e
-          if [ ! -f public/index.html ] && [ -f public/report.pdf ]; then
-            cat > public/index.html <<'HTML'
-<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Report</title>
-<p>If you are not redirected, <a href="./report.pdf">open the PDF</a>.</p>
-<script>location.href="./report.pdf";</script>
-HTML
-          fi
-          echo "== final public content =="
-          ls -l public
+          bash scripts/pack_pages.sh
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
