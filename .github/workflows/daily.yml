@@ -1,12 +1,9 @@
 name: Daily Report + Pages Deploy
 
 on:
-  # 每天 09:00（北京）跑一次；也可以手动触发；当 main 有变更也会跑
   schedule:
-    - cron: "0 1 * * *"      # 01:00 UTC = 09:00 Beijing
+    - cron: "30 21 * * 1-5"   # 每个交易日美股收盘后（UTC，按需改）
   workflow_dispatch: {}
-  push:
-    branches: [ main ]
 
 permissions:
   contents: read
@@ -29,35 +26,41 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      # ★ 生成 PDF（这里会执行 report.py，顺便调用 Server酱 / PushPlus 推送）
-      - name: Generate PDF (and send WeChat/PushPlus)
+      - name: Run report
         env:
-          REPORT_URL: ${{ secrets.REPORT_URL }}                # 例：https://<user>.github.io/<repo>/report.pdf
-          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }} # Server酱可选
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}        # PushPlus 可选
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}      # 如果你用到了 peers 动态获取
+          # 若使用 Finnhub：到仓库 Settings → Secrets → Actions 新建 FINNHUB_API_KEY
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          # Server酱 Turbo：WECHAT_SCT_SENDKEY 同样放在 Secrets
+          WECHAT_SCT_SENDKEY: ${{ secrets.WECHAT_SCT_SENDKEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # 用你的 Pages 地址替换下面两行
+          REPORT_URL: https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/report.pdf
+          SITE_URL:   https://stephxin-afk.github.io/Daily-Resistance-and-Support-Level/
         run: python report.py
 
-      # 把要发布的文件放进 public 目录（现在只放 report.pdf，后续可加 index.html 等）
-      - name: Prepare public folder
+      - name: Prepare Pages artifact
         run: |
           mkdir -p public
           mv report.pdf public/
+          mv index.html public/
+          mv table.csv public/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
+          name: github-pages
+          retention-days: 1
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
