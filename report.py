@@ -24,6 +24,7 @@ import requests
 import pandas as pd
 import yfinance as yf
 import matplotlib
+matplotlib.use("Agg")  # <<< 确保在无头环境能画图
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
